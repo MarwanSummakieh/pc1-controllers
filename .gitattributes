@@ -1,0 +1,31 @@
+# Force LF everywhere. This repo is authored on Windows but every artefact in it
+# is consumed by Linux: the shell scripts run under bash, and everything under
+# os/files/ is copied verbatim into the OS image.
+#
+# Without this, git's autocrlf would hand out CRLF on checkout, and a script with
+# a trailing \r in its shebang fails as "bad interpreter" while a systemd or bootc
+# config with CRLF is parsed wrong or silently ignored. We already lost time to
+# exactly this failure mode once, via a CRLF-terminated SSH key that made
+# bootc-image-builder reject its own TOML.
+
+* text=auto eol=lf
+
+# Belt and braces for the files that would hurt most.
+*.sh        text eol=lf
+*.toml      text eol=lf
+*.conf      text eol=lf
+*.yml       text eol=lf
+Containerfile text eol=lf
+
+# Disk images, archives and artwork must never be touched.
+*.vhdx      binary
+*.qcow2     binary
+*.raw       binary
+*.iso       binary
+*.bmp       binary
+*.png       binary
+*.ttf       binary
+*.woff2     binary
+
+# Historical upstream patch evidence retains its original context whitespace.
+*.patch     -whitespace
