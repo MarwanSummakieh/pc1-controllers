@@ -28,11 +28,12 @@ def wait_for(predicate, label, timeout=5):
     raise AssertionError(label)
 
 
-def device_path(name):
+def device_path(name, physical=None):
     result = []
     def find():
         for path in Path("/sys/class/input").glob("event*"):
-            if (path / "device/name").read_text().strip() == name:
+            if ((path / "device/name").read_text().strip() == name
+                    and (physical is None or (path / "device/phys").read_text().strip() == physical)):
                 target = Path("/dev/input") / path.name
                 if not target.exists():
                     # WSL may expose sysfs uinput events without a udev daemon.
@@ -58,8 +59,9 @@ def events(fd, duration=.08):
 class Physical:
     """A kernel-backed physical fixture completing real FF ioctl callbacks."""
     def __init__(self, index, rumble=True):
+        self.input_id = {1: (3, 0x054c, 0x0ce6, 0x8111), 2: (3, 0x045e, 0x028e, 0x0114)}.get(index, (3, 0x1209, 2, 1))
         self.pad = router.VirtualPad(f"PC1 physical fixture {index}", rumble,
-                                     physical=f"pc1-test-port-{index}")
+                                     physical=f"pc1-test-port-{index}", input_id=self.input_id)
         self.path = device_path(f"PC1 physical fixture {index}")
         self.buttons, self.axes = [0] * 15, [0.] * 6
         self.effects, self.playback, self.erased = {}, [], []
@@ -100,16 +102,83 @@ class Physical:
         self.pad.close()
 
 
+def check_discovery_during_pending_feedback():
+    """Discovery must not take the evdev mutex held by a waiting FF uploader."""
+    name = 'Sony DualSense discovery regression'
+    pad = router.VirtualPad(name, physical='pc1/application/slot4', input_id=(3, 0x054c, 0x0ce6, 0x8111))
+    path = device_path(name, 'pc1/application/slot4')
+    output = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    broker = router.Router.__new__(router.Router)
+    broker.devices = {}
+    rumble = router.Rumble()
+    failures = []
+    def upload_pending():
+        effect = router.FFEffect()
+        effect.type, effect.id = router.FF_RUMBLE, -1
+        try:
+            router.struct_ioctl(output, router.EVIOCSFF, effect)
+        except OSError as error:
+            if error.errno != errno.ENODEV:
+                failures.append(error)
+    uploader = threading.Thread(target=upload_pending)
+    scanner = threading.Thread(target=broker.scan)
+    uploader.start()
+    try:
+        wait_for(lambda: bool(select.select([pad.fd], [], [], 0)[0]), 'FF callback was not queued')
+        with patch.object(router.glob, 'glob', return_value=[path]):
+            scanner.start()
+            scanner.join(1)
+            assert not scanner.is_alive(), 'discovery blocked on its own virtual evdev mutex'
+    finally:
+        # Complete the pending callback even if discovery regresses; that also
+        # releases the evdev mutex so the scanner can exit without a 30s wait.
+        pad.read_feedback(rumble)
+        uploader.join(2)
+        if scanner.ident is not None:
+            scanner.join(2)
+        os.close(output)
+        pad.close()
+    assert not uploader.is_alive() and not scanner.is_alive()
+    assert not failures, failures
+
+
+def check_removal_during_pending_feedback():
+    pad = router.VirtualPad(router.VIRTUAL_NAME + ' removal regression')
+    output = os.open(device_path(router.VIRTUAL_NAME + ' removal regression'), os.O_RDWR | os.O_NONBLOCK)
+    errors = []
+    def upload_pending():
+        effect = router.FFEffect()
+        effect.type, effect.id = router.FF_RUMBLE, -1
+        try:
+            router.struct_ioctl(output, router.EVIOCSFF, effect)
+        except OSError as error:
+            errors.append(error.errno)
+    uploader = threading.Thread(target=upload_pending)
+    uploader.start()
+    try:
+        wait_for(lambda: bool(select.select([pad.fd], [], [], 0)[0]), 'removal FF callback was not queued')
+        started = time.monotonic()
+        pad.close()
+        uploader.join(1)
+        assert time.monotonic() - started < 1, 'virtual removal stalled on pending rumble'
+        assert not uploader.is_alive() and errors == [errno.ENODEV], 'removed pad did not fail pending FF with ENODEV'
+    finally:
+        pad.close()
+        uploader.join(2)
+        os.close(output)
+
+
 def run():
+    check_discovery_during_pending_feedback()
+    check_removal_during_pending_feedback()
     with tempfile.TemporaryDirectory(prefix="pc1-controller-kernel-") as temporary:
         first, second, unsupported = Physical(1), Physical(2), Physical(3, False)
         fixtures = [first, second, unsupported]
         paths = [fixture.path for fixture in fixtures]
         observer = os.open(first.path, os.O_RDONLY | os.O_NONBLOCK)
-        broker = router.Router(temporary)
-        output = [os.open(device_path(router.VIRTUAL_NAME if slot.index == 0 else
-                    f"{router.VIRTUAL_NAME} {slot.index + 1}"), os.O_RDWR | os.O_NONBLOCK)
-                  for slot in broker.slots]
+        broker = router.Router(temporary, allow_uinput_sources=True)
+        assert all(slot.pad is None for slot in broker.slots), "absent players exposed fake connected pads"
+        output = []
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         client.bind(("127.0.0.1", 0))
         client.settimeout(2)
@@ -133,7 +202,20 @@ def run():
         try:
             with patch.object(router.glob, "glob", side_effect=lambda _pattern: list(paths)):
                 thread.start()
-                wait_for(lambda: len(broker.devices) == 3, "physical fixtures not grabbed")
+                wait_for(lambda: len(broker.devices) == 3 and sum(slot.pad is not None for slot in broker.slots) == 3,
+                         "physical fixtures and corresponding application devices not attached")
+                assert broker.slots[3].pad is None, "unused player slot exposed a connected device"
+                original_pads = [slot.pad for slot in broker.slots[:3]]
+                for code in (1, 2):
+                    broker.slots[0].rumble.handle(original_pads[0].fd, router.EV_UINPUT, code, 0)
+                assert [slot.pad for slot in broker.slots[:3]] == original_pads
+                output.extend(os.open(device_path(slot.name, f"pc1/application/slot{slot.index + 1}"), os.O_RDWR | os.O_NONBLOCK)
+                              for slot in broker.slots[:3])
+                for fd, fixture, slot in zip(output, fixtures, broker.slots):
+                    actual = bytearray(8)
+                    router.fcntl.ioctl(fd, 0x80084502, actual)
+                    assert router.struct.unpack('HHHH', actual) == (router.BUS_VIRTUAL, *fixture.input_id[1:]), 'virtual device lost hardware model IDs'
+                    assert slot.name == slot.device['name'], 'virtual device lost hardware model name'
                 mode(False)
                 first.button(0, True)
                 second.button(1, True)
@@ -209,23 +291,48 @@ def run():
                 paths.remove(first.path)
                 first.close()
                 fixtures.remove(first)
-                wait_for(lambda: broker.slots[0].device is None, "disconnect did not clear player one")
+                wait_for(lambda: broker.slots[0].device is None and broker.slots[0].pad is None and original_pads[0].fd < 0,
+                         "disconnect did not remove player one's virtual device")
+                try:
+                    os.read(output[0], router.EVENT.size * 128)
+                    raise AssertionError("application's old controller handle did not disconnect")
+                except OSError as failure:
+                    assert failure.errno == errno.ENODEV
+                assert broker.slots[1].pad is original_pads[1], "disconnect recreated player two's device"
+                mode(True)
+                second.button(0, True)
+                assert any(e[2:] == (1, 304, 1) for e in events(output[1])), "player two stopped during player one disconnect"
+                second.button(0, False)
                 try:
                     upload(0)
                     raise AssertionError("disconnected pad accepted rumble")
                 except OSError as failure:
                     assert failure.errno == errno.ENODEV
                 first = Physical(1)
+                first.button(0, True)  # Replug with a held button must start neutral.
                 fixtures.append(first)
                 paths.append(first.path)
-                wait_for(lambda: broker.slots[0].device is not None, "reconnect did not reattach player one")
+                wait_for(lambda: broker.slots[0].device is not None and broker.slots[0].pad is not None,
+                         "reconnect did not recreate player one's application device")
                 assert broker.slots[0].identity == old_identity
+                assert broker.slots[0].pad is not original_pads[0], "reconnect retained the removed device"
+                assert broker.slots[1].pad is original_pads[1], "reconnect recreated player two's device"
                 assert broker.slots[1].device["path"] == second.path, "reconnect displaced player two"
                 assert not first.playback, "reconnect restarted rumble automatically"
+                assert not broker.slots[0].rumble.effects, "old-device rumble effects leaked into new device"
+                os.close(output[0])
+                output[0] = os.open(device_path(broker.slots[0].name, 'pc1/application/slot1'), os.O_RDWR | os.O_NONBLOCK)
                 mode(True)
+                assert not [e for e in events(output[0]) if e[2] == 1 and e[4]], "held reconnect input leaked"
+                first.button(0, False)
+                time.sleep(.04)
+                first.button(0, True)
+                assert any(e[2:] == (1, 304, 1) for e in events(output[0])), "fresh reconnected input missing"
+                first.button(0, False)
+                effects[0] = upload(0)
                 play(0, effects[0])
                 assert first.playback[-1][1] == 1 and first.effects, "fresh request did not restore reconnected pad effect"
-                print("Controller kernel checks: exclusive grabs, independent multiplayer slots, menu/lease/Home gating, held suppression, rumble upload/update/play/cancel/erase, errors and identity reconnect PASS")
+                print("Controller kernel checks: exclusive grabs, independent multiplayer slots, menu/lease/Home gating, held suppression, rumble upload/update/play/cancel/erase, retired callback survival, pending-FF discovery without deadlock, game-visible removal/recreation, uninterrupted player two, errors and identity reconnect PASS")
         finally:
             broker.stopping = True
             thread.join(3)

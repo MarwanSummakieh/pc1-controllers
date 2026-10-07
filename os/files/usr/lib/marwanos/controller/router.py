@@ -21,6 +21,8 @@ BUTTONS = {304: 0, 305: 1, 308: 2, 307: 3, 314: 4, 316: 5,
            544: 11, 545: 12, 546: 13, 547: 14}
 AXES = {0: 0, 1: 1, 3: 2, 4: 3, 2: 4, 5: 5}
 VIRTUAL_NAME = "PC1 application controller"
+VIRTUAL_PHYSICAL_PREFIX = "pc1/application/slot"
+BUS_VIRTUAL = 6
 MAX_PLAYERS = 4
 EV_FF, EV_UINPUT, FF_RUMBLE = 21, 0x101, 0x50
 
@@ -166,7 +168,16 @@ class Rumble:
             operation = FFUpload(value, 0) if code == 1 else FFErase(value, 0, 0)
             begin = UI_BEGIN_FF_UPLOAD if code == 1 else UI_BEGIN_FF_ERASE
             end = UI_END_FF_UPLOAD if code == 1 else UI_END_FF_ERASE
-            struct_ioctl(pad_fd, begin, operation)
+            try:
+                struct_ioctl(pad_fd, begin, operation)
+            except OSError as error:
+                # A queued event can outlive its kernel FF request (for example
+                # after its 30-second timeout). There is then no callback to
+                # finish. Keep the stable pads alive instead of restarting the
+                # whole broker and removing every game's input device.
+                if error.errno == errno.EINVAL:
+                    return
+                raise
             try:
                 if code == 1:
                     self.upload(operation.effect)
@@ -177,7 +188,12 @@ class Rumble:
             finally:
                 # Always finish the kernel callback, including unsupported pads,
                 # disconnects and upload failures; otherwise the game blocks.
-                struct_ioctl(pad_fd, end, operation)
+                try:
+                    struct_ioctl(pad_fd, end, operation)
+                except OSError as error:
+                    # The request can also retire while the physical ioctl runs.
+                    if error.errno != errno.EINVAL:
+                        raise
         elif kind == EV_FF:
             try:
                 self.play(code, value)
@@ -186,8 +202,20 @@ class Rumble:
 
 
 class VirtualPad:
-    def __init__(self, name=VIRTUAL_NAME, rumble=True, physical=None):
+    def __init__(self, name=VIRTUAL_NAME, rumble=True, physical=None, input_id=None):
         self.fd = os.open("/dev/uinput", os.O_RDWR | os.O_NONBLOCK)
+        try:
+            self.configure(name, rumble, physical, input_id)
+        except OSError:
+            os.close(self.fd)
+            self.fd = -1
+            raise
+
+    def configure(self, name, rumble, physical, input_id):
+        # Preserve the hardware model, but identify our transport as virtual.
+        # Its distinct SDL GUID gets a mapping from our actual capabilities,
+        # rather than a USB/Bluetooth mapping for unforwarded hardware controls.
+        device_id = (BUS_VIRTUAL, *input_id[1:]) if input_id else (3, 0x1209, 1, 1)
         if physical:
             fcntl.ioctl(self.fd, ioctl_number(1, "U", 108, ctypes.sizeof(ctypes.c_void_p)),
                         physical.encode() + b"\0")
@@ -196,6 +224,9 @@ class VirtualPad:
         if rumble:
             fcntl.ioctl(self.fd, 0x4004556b, FF_RUMBLE)
         self.keys = {v: k for k, v in BUTTONS.items()}
+        if input_id and input_id[1] != 0x054c:
+            # Linux Xbox-style drivers use BTN_X/Y; Sony uses BTN_WEST/NORTH.
+            self.keys[2], self.keys[3] = 307, 308
         for key in self.keys.values():
             fcntl.ioctl(self.fd, 0x40045565, key)
         self.axis_codes = {v: k for k, v in AXES.items()}
@@ -205,7 +236,7 @@ class VirtualPad:
             fcntl.ioctl(self.fd, 0x401c5504,
                         struct.pack("H2xiiiiii", code, 0, minimum, 32767, 0, 1024, 0))
         fcntl.ioctl(self.fd, 0x405c5503,
-                    struct.pack("HHHH80sI", 3, 0x1209, 0x0001, 1, name.encode(), 16 if rumble else 0))
+                    struct.pack("HHHH80sI", *device_id, name.encode()[:79], 16 if rumble else 0))
         fcntl.ioctl(self.fd, 0x5501)
         self.buttons, self.axes = [0] * 15, [0] * 6
 
@@ -231,27 +262,40 @@ class VirtualPad:
             rumble.handle(self.fd, kind, code, value)
 
     def close(self):
-        self.update([0] * 15, [0.0] * 6)
-        fcntl.ioctl(self.fd, 0x5502)
-        os.close(self.fd)
+        if self.fd < 0:
+            return
+        try:
+            self.update([0] * 15, [0.0] * 6)
+        finally:
+            try:
+                # UI_DEV_DESTROY also completes pending FF requests with ENODEV.
+                fcntl.ioctl(self.fd, 0x5502)
+            finally:
+                os.close(self.fd)
+                self.fd = -1
 
 
 class Slot:
     def __init__(self, index, identity=""):
         self.index, self.identity, self.device = index, identity, None
-        name = VIRTUAL_NAME if index == 0 else f"{VIRTUAL_NAME} {index + 1}"
-        self.pad, self.gate, self.rumble = VirtualPad(name), Gate(), Rumble()
+        self.name = VIRTUAL_NAME if index == 0 else f"{VIRTUAL_NAME} {index + 1}"
+        self.pad, self.gate, self.rumble = None, Gate(), Rumble()
         self.buttons, self.axes = [0] * 15, [0.] * 6
 
     def active(self, enabled):
         enabled = bool(enabled and self.device)
         self.gate.set_active(enabled, self.buttons, self.axes)
         self.rumble.set_active(enabled)
-        self.pad.update(*self.gate.output(self.buttons, self.axes))
+        if self.pad is not None:
+            self.pad.update(*self.gate.output(self.buttons, self.axes))
 
 
 class Router:
-    def __init__(self, directory=None):
+    def __init__(self, directory=None, allow_uinput_sources=False):
+        # Real sources can be USB, Bluetooth or UHID. Third-party uinput pads
+        # (including Steam Input outputs) are application devices, not sources.
+        # Only the kernel fixture opts in to synthetic physical sources.
+        self.allow_uinput_sources = allow_uinput_sources
         runtime = directory or os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
         self.directory = Path(runtime) / "marwanos/controller"
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -327,6 +371,17 @@ class Router:
                 continue
             fd = None
             try:
+                # Never ioctl our own evdev nodes during discovery. A game's
+                # EVIOCSFF holds the evdev mutex until this same loop services
+                # its uinput callback, so even EVIOCGNAME would deadlock until
+                # the request times out. Sysfs names do not take that mutex.
+                sysname = Path('/sys/class/input') / Path(path).name / 'device/name'
+                if (sysname.read_text().strip().startswith(VIRTUAL_NAME)
+                        or (sysname.parent / 'phys').read_text().strip().startswith(VIRTUAL_PHYSICAL_PREFIX)):
+                    continue
+                if (not getattr(self, 'allow_uinput_sources', False)
+                        and str(sysname.parent.resolve()).startswith('/sys/devices/virtual/input/')):
+                    continue
                 writable = True
                 try:
                     fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
@@ -353,6 +408,12 @@ class Router:
                     os.close(fd)
                     continue
                 identity = self.identity(fd, path, name)
+                input_id = bytearray(8)
+                fcntl.ioctl(fd, 0x80084502, input_id)
+                input_id = struct.unpack("HHHH", input_id)
+                buttons = dict(BUTTONS)
+                if input_id[1] != 0x054c:
+                    buttons[307], buttons[308] = 2, 3
                 if any(slot.identity == identity and slot.device for slot in self.slots):
                     os.close(fd)
                     continue
@@ -367,12 +428,17 @@ class Router:
                     pass
                 fcntl.ioctl(fd, 0x40044590, 1)  # EVIOCGRAB
                 device = {"fd": fd, "name": name, "path": path, "ranges": ranges,
+                          "input_id": input_id, "buttons": buttons,
                           "sync_lost": False, "slot": slot,
                           "rumble": writable and bool(ff_bits[FF_RUMBLE // 8] & (1 << (FF_RUMBLE % 8)))}
                 self.devices[fd], slot.device = device, device
                 slot.rumble.bind(device)
                 slot.buttons, slot.axes = [0] * 15, [0.] * 6
                 self.resync(device)
+                # Remember the player slot, not an always-connected fake pad.
+                # The game's input API must see removal when USB is unplugged.
+                slot.name = name
+                slot.pad = VirtualPad(name, physical=f"{VIRTUAL_PHYSICAL_PREFIX}{slot.index + 1}", input_id=input_id)
                 slot.active(False)
                 print(f"Controller player {slot.index + 1} connected: {name}; rumble={device['rumble']}", flush=True)
             except OSError as error:
@@ -389,10 +455,16 @@ class Router:
         slot = device["slot"]
         slot.active(False)
         slot.rumble.bind(None)
+        slot.rumble.effects.clear()
         slot.device = None
         slot.buttons, slot.axes = [0] * 15, [0.] * 6
-        slot.pad.update(slot.buttons, slot.axes)
-        os.close(fd)
+        pad, slot.pad = slot.pad, None
+        try:
+            if pad is not None:
+                pad.close()
+        finally:
+            os.close(fd)
+        print(f"Controller player {slot.index + 1} disconnected; application device removed", flush=True)
 
     def event(self, device, kind, code, value):
         slot = device["slot"]
@@ -401,8 +473,9 @@ class Router:
                 self.resync(device)
                 device["sync_lost"] = False
             return
-        if kind == 1 and code in BUTTONS:
-            slot.buttons[BUTTONS[code]] = int(bool(value))
+        buttons = device.get("buttons", BUTTONS)
+        if kind == 1 and code in buttons:
+            slot.buttons[buttons[code]] = int(bool(value))
             if code in (314, 316) and value:
                 self.set_active(False)
         elif kind == 3 and code in (16, 17):
@@ -422,7 +495,7 @@ class Router:
         keys = bytearray(96)
         fcntl.ioctl(fd, 0x80604518, keys)
         slot.buttons, slot.axes = [0] * 15, [0.] * 6
-        for code, index in BUTTONS.items():
+        for code, index in device.get("buttons", BUTTONS).items():
             slot.buttons[index] = int(bool(keys[code // 8] & (1 << (code % 8))))
         for code in device["ranges"]:
             values = array.array("i", [0] * 6)
@@ -525,7 +598,7 @@ class Router:
                 if now >= next_scan:
                     self.scan()
                     next_scan = now + 1.0
-                pads = {slot.pad.fd: slot for slot in self.slots}
+                pads = {slot.pad.fd: (slot, slot.pad) for slot in self.slots if slot.pad is not None}
                 ready, _, _ = select.select([self.socket, *self.devices, *pads], [], [], 1 / 120)
                 if self.socket in ready:
                     self.receive()
@@ -536,17 +609,20 @@ class Router:
                         self.read_device(fd)
                 if time.monotonic() > self.lease or any(slot.buttons[4] or slot.buttons[5] for slot in self.slots):
                     self.set_active(False)
-                for fd, slot in pads.items():
-                    if fd in ready:
-                        slot.pad.read_feedback(slot.rumble)
+                for fd, (slot, pad) in pads.items():
+                    # Physical reads above may destroy a ready virtual pad.
+                    if fd in ready and slot.pad is pad:
+                        pad.read_feedback(slot.rumble)
                 for slot in self.slots:
-                    slot.pad.update(*slot.gate.output(slot.buttons, slot.axes))
+                    if slot.pad is not None:
+                        slot.pad.update(*slot.gate.output(slot.buttons, slot.axes))
                 self.publish()
         finally:
             for fd in list(self.devices):
                 self.disconnect(fd)
             for slot in self.slots:
-                slot.pad.close()
+                if slot.pad is not None:
+                    slot.pad.close()
             self.endpoint.unlink(missing_ok=True)
             self.socket.close()
 

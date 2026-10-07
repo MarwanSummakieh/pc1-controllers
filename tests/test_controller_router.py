@@ -57,7 +57,8 @@ class ControllerRecoveryTests(unittest.TestCase):
         self.broker = router.Router.__new__(router.Router)
         self.slot = SimpleNamespace(buttons=[0] * 15, axes=[0.] * 6,
                                     gate=router.Gate(), pad=Mock(), rumble=Mock())
-        self.device = {"fd": 10, "ranges": {0: (-32768, 32767), 1: (-32768, 32767)}, "slot": self.slot}
+        self.device = {"fd": 10, "path": "/dev/input/event6",
+                       "ranges": {0: (-32768, 32767), 1: (-32768, 32767)}, "slot": self.slot}
         self.slot.device = self.device
         self.broker.devices = {10: self.device}
         self.broker.slots = [self.slot]
@@ -98,6 +99,45 @@ class ControllerRecoveryTests(unittest.TestCase):
         with patch.object(router.os, 'read', side_effect=OSError('Device removed')):
             self.broker.read_device(10)
         self.broker.disconnect.assert_called_once_with(10)
+
+    def test_discovery_skips_virtual_pads_before_any_evdev_open_or_ioctl(self):
+        for name in (router.VIRTUAL_NAME, router.VIRTUAL_NAME + ' 2'):
+            with self.subTest(name=name), patch.object(router.glob, 'glob', return_value=['/dev/input/event22']), \
+                    patch.object(router.Path, 'read_text', return_value=name), \
+                    patch.object(router.os, 'open') as open_device, patch.object(router.fcntl, 'ioctl') as ioctl:
+                self.broker.scan()
+                open_device.assert_not_called()
+                ioctl.assert_not_called()
+
+    def test_disappearing_sysfs_node_does_not_fall_back_to_blocking_evdev_probe(self):
+        with patch.object(router.glob, 'glob', return_value=['/dev/input/event22']), \
+                patch.object(router.Path, 'read_text', side_effect=FileNotFoundError()), \
+                patch.object(router.os, 'open') as open_device:
+            self.broker.scan()
+        open_device.assert_not_called()
+
+    def test_model_named_virtual_pad_is_skipped_using_physical_slot_label(self):
+        with patch.object(router.glob, 'glob', return_value=['/dev/input/event22']), \
+                patch.object(router.Path, 'read_text', side_effect=['Sony DualSense', 'pc1/application/slot1']), \
+                patch.object(router.os, 'open') as open_device:
+            self.broker.scan()
+        open_device.assert_not_called()
+
+    def test_steam_input_output_is_not_grabbed_as_a_physical_controller(self):
+        with patch.object(router.glob, 'glob', return_value=['/dev/input/event22']), \
+                patch.object(router.Path, 'read_text', side_effect=['Microsoft X-Box 360 pad', '']), \
+                patch.object(router.Path, 'resolve', return_value=Path('/sys/devices/virtual/input/input42')), \
+                patch.object(router.os, 'open') as open_device:
+            self.broker.scan()
+        open_device.assert_not_called()
+
+    def test_bluetooth_uhid_is_still_a_physical_source(self):
+        with patch.object(router.glob, 'glob', return_value=['/dev/input/event22']), \
+                patch.object(router.Path, 'read_text', side_effect=['Sony DualSense', '']), \
+                patch.object(router.Path, 'resolve', return_value=Path('/sys/devices/virtual/misc/uhid/0005:054C:0CE6/input/input42')), \
+                patch.object(router.os, 'open', side_effect=PermissionError()) as open_device:
+            self.broker.scan()
+        open_device.assert_called()
 
 
 class RumbleTests(unittest.TestCase):
@@ -192,6 +232,120 @@ class RumbleTests(unittest.TestCase):
             self.assertEqual(effect.id, 7)
         with patch.object(router, "struct_ioctl", side_effect=ioctl):
             self.rumble.upload(self.effect)
+
+    def test_retired_upload_or_erase_request_does_not_remove_gamepads(self):
+        for code, begin in ((1, router.UI_BEGIN_FF_UPLOAD), (2, router.UI_BEGIN_FF_ERASE)):
+            with self.subTest(code=code), patch.object(router, "struct_ioctl",
+                    side_effect=OSError(errno.EINVAL, "request already retired")) as ioctl, \
+                    patch.object(self.rumble, "upload") as upload, patch.object(self.rumble, "erase") as erase:
+                self.rumble.handle(40, router.EV_UINPUT, code, 123)
+                ioctl.assert_called_once()
+                self.assertEqual(ioctl.call_args.args[:2], (40, begin))
+                upload.assert_not_called()
+                erase.assert_not_called()
+
+    def test_request_retiring_during_physical_callback_keeps_broker_alive(self):
+        for code, end in ((1, router.UI_END_FF_UPLOAD), (2, router.UI_END_FF_ERASE)):
+            calls = []
+            def ioctl(fd, request, operation):
+                calls.append(request)
+                if request == end:
+                    raise OSError(errno.EINVAL, "request timed out during physical ioctl")
+            with self.subTest(code=code), patch.object(router, "struct_ioctl", side_effect=ioctl), \
+                    patch.object(self.rumble, "upload"), patch.object(self.rumble, "erase"):
+                self.rumble.handle(40, router.EV_UINPUT, code, 123)
+                self.assertEqual(calls[-1], end)
+
+    def test_unexpected_callback_ioctl_errors_are_not_hidden(self):
+        for failing_request in (router.UI_BEGIN_FF_UPLOAD, router.UI_END_FF_UPLOAD):
+            def ioctl(fd, request, operation):
+                if request == failing_request:
+                    raise OSError(errno.EIO, "unexpected device fault")
+            with self.subTest(request=failing_request), patch.object(router, "struct_ioctl", side_effect=ioctl), \
+                    patch.object(self.rumble, "upload"), self.assertRaises(OSError) as failure:
+                self.rumble.handle(40, router.EV_UINPUT, 1, 123)
+            self.assertEqual(failure.exception.errno, errno.EIO)
+
+
+class VirtualDeviceLifecycleTests(unittest.TestCase):
+    def test_virtual_identity_preserves_model_and_uses_distinct_virtual_transport(self):
+        for identity in ((3, 0x054c, 0x0ce6, 0x8111), (5, 0x045e, 0x0b13, 0x0509), (3, 0x1234, 0xabcd, 1)):
+            with self.subTest(identity=identity), patch.object(router.os, 'open', return_value=40), \
+                    patch.object(router.fcntl, 'ioctl') as ioctl:
+                pad = router.VirtualPad('Real model', input_id=identity)
+                setup = next(call.args[2] for call in ioctl.call_args_list if call.args[1] == 0x405c5503)
+                values = struct.unpack('HHHH80sI', setup)
+                self.assertEqual(values[:4], (6, *identity[1:]))
+                self.assertEqual(values[4].split(b'\0')[0], b'Real model')
+                self.assertEqual((pad.keys[2], pad.keys[3]), (308, 307) if identity[1] == 0x054c else (307, 308))
+
+    def test_physical_face_buttons_follow_vendor_semantics(self):
+        for vendor, code in ((0x054c, 308), (0x045e, 307)):
+            broker = router.Router.__new__(router.Router)
+            slot = router.Slot(0)
+            buttons = dict(router.BUTTONS)
+            if vendor != 0x054c:
+                buttons[307], buttons[308] = 2, 3
+            broker.event({'slot': slot, 'buttons': buttons}, 1, code, 1)
+            self.assertEqual(slot.buttons[2:4], [1, 0])
+
+    def test_empty_slots_do_not_create_connected_application_devices(self):
+        with patch.object(router, "VirtualPad") as create:
+            slot = router.Slot(0, "remembered")
+            slot.active(True)
+        create.assert_not_called()
+        self.assertIsNone(slot.pad)
+        self.assertFalse(slot.gate.active)
+
+    def test_disconnect_removes_only_matching_pad_and_clears_old_effects(self):
+        broker = router.Router.__new__(router.Router)
+        first, second = router.Slot(0, "first"), router.Slot(1, "second")
+        first.pad, second.pad = Mock(), Mock()
+        removed, remaining = first.pad, second.pad
+        first.device = {"fd": 10, "slot": first}
+        second.device = {"fd": 11, "slot": second}
+        first.rumble.effects[3] = b"old device effect"
+        broker.slots = [first, second]
+        broker.devices = {10: first.device, 11: second.device}
+        with patch.object(router.os, "close") as close:
+            broker.disconnect(10)
+            broker.disconnect(10)
+        removed.close.assert_called_once()
+        remaining.close.assert_not_called()
+        close.assert_called_once_with(10)
+        self.assertIsNone(first.pad)
+        self.assertIsNone(first.device)
+        self.assertEqual(first.identity, "first")
+        self.assertEqual(first.rumble.effects, {})
+        self.assertIs(second.pad, remaining)
+        self.assertIn(11, broker.devices)
+
+    def test_failed_virtual_setup_does_not_leak_uinput_fd(self):
+        with patch.object(router.os, "open", return_value=40), \
+                patch.object(router.VirtualPad, "configure", side_effect=OSError(errno.EIO, "setup failed")), \
+                patch.object(router.os, "close") as close, self.assertRaises(OSError):
+            router.VirtualPad()
+        close.assert_called_once_with(40)
+
+    def test_ready_feedback_is_not_read_after_physical_disconnect_removes_pad(self):
+        broker = router.Router.__new__(router.Router)
+        slot = router.Slot(0, "first")
+        slot.pad = Mock(fd=20)
+        removed = slot.pad
+        slot.device = {"fd": 10, "slot": slot}
+        broker.slots, broker.devices = [slot], {10: slot.device}
+        broker.socket, broker.endpoint = Mock(), Mock()
+        broker.stopping, broker.lease = False, float("inf")
+        broker.scan, broker.publish = Mock(), Mock()
+        def read(_fd):
+            broker.disconnect(10)
+            broker.stopping = True
+        broker.read_device = read
+        with patch.object(router.select, "select", return_value=([10, 20], [], [])), \
+                patch.object(router.os, "close"):
+            broker.run()
+        removed.close.assert_called_once()
+        removed.read_feedback.assert_not_called()
 
 
 class MultiplayerTests(unittest.TestCase):
