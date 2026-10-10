@@ -53,12 +53,13 @@ def load_router(path):
     return module
 
 
-def device_path(name, timeout=5):
+def device_path(name, timeout=5, physical=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for path in Path("/sys/class/input").glob("event*"):
             try:
-                if (path / "device/name").read_text().strip() == name:
+                if ((path / "device/name").read_text().strip() == name
+                        and (physical is None or (path / 'device/phys').read_text().strip() == physical)):
                     return "/dev/input/" + path.name
             except OSError:
                 continue
@@ -96,11 +97,11 @@ def exclusive_grabbed(fd):
 class Fixture:
     def __init__(self, args):
         self.router = load_router(args.router)
-        self.pad = self.router.VirtualPad(args.name)
+        self.pad = self.router.VirtualPad(args.name, input_id=(3, 0x054c, 0x0ce6, 0x8111))
         self.pad.keys = dict(LINUX_BUTTON_CODES)
         self.physical_path = device_path(args.name)
         self.physical = os.open(self.physical_path, os.O_RDONLY | os.O_NONBLOCK)
-        self.application_path = device_path(self.router.VIRTUAL_NAME)
+        self.application_path = device_path(args.name, physical='pc1/application/slot1')
         self.application = os.open(self.application_path, os.O_RDONLY | os.O_NONBLOCK)
         self.buttons = [0] * 15
         self.axes = [0.] * 6
